@@ -1,5 +1,7 @@
 // server.js - Node.js Backend for Polymarket Tracker
 // Install dependencies: npm install express cors axios ws pg node-cron dotenv
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
 
 const express = require('express');
 const cors = require('cors');
