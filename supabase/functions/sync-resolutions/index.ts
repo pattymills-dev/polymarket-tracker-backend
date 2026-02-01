@@ -19,87 +19,143 @@ serve(async (req) => {
 
     console.log('Syncing market resolutions...')
 
-    // Get all unique market IDs from trades that don't have resolution data yet
-    const { data: unresolvedMarkets, error: fetchError } = await supabase
-      .from('markets')
-      .select('id')
-      .or('resolved.is.null,resolved.eq.false')
-      .limit(100)
-
-    if (fetchError) {
-      console.error('Error fetching unresolved markets:', fetchError)
-      throw fetchError
-    }
-
-    console.log(`Found ${unresolvedMarkets?.length || 0} markets to check`)
-
     let updated = 0
     let checked = 0
 
+    // Step 1: Get unresolved markets from our database
+    const { data: unresolvedMarkets, error: fetchError } = await supabase
+      .from('markets')
+      .select('id, question, slug')
+      .or('resolved.is.null,resolved.eq.false')
+      .limit(200)
+
+    if (fetchError) {
+      console.error('Error fetching unresolved markets:', fetchError)
+    }
+
+    console.log(`Found ${unresolvedMarkets?.length || 0} unresolved markets in database`)
+
+    // Step 2: For each unresolved market, try to look it up on Polymarket by conditionId
     for (const market of unresolvedMarkets || []) {
       checked++
+
       try {
-        // Fetch market details from Polymarket API
-        // Try the slug-based endpoint first
-        const response = await fetch(`https://gamma-api.polymarket.com/markets/${market.id}`, {
+        // Try lookup by conditionId (our market.id)
+        const response = await fetch(`https://gamma-api.polymarket.com/markets?condition_id=${market.id}`, {
           headers: { 'Accept': 'application/json' }
         })
 
-        if (!response.ok) {
-          console.log(`Market ${market.id} not found via direct lookup`)
-          continue
-        }
+        if (response.ok) {
+          const markets = await response.json()
+          if (markets && markets.length > 0) {
+            const pmMarket = markets[0]
 
-        const marketData = await response.json()
+            if (pmMarket.closed) {
+              let winningOutcome = null
 
-        // Check if market is closed (resolved)
-        if (marketData.closed) {
-          // Parse outcome prices to determine winner
-          let winningOutcome = null
+              if (pmMarket.outcomePrices) {
+                try {
+                  const prices = JSON.parse(pmMarket.outcomePrices)
+                  const outcomes = JSON.parse(pmMarket.outcomes || '["Yes", "No"]')
 
-          if (marketData.outcomePrices) {
-            try {
-              const prices = JSON.parse(marketData.outcomePrices)
-              const outcomes = JSON.parse(marketData.outcomes || '["Yes", "No"]')
+                  let maxPrice = 0
+                  let maxIdx = 0
+                  for (let i = 0; i < prices.length; i++) {
+                    const price = parseFloat(prices[i])
+                    if (price > maxPrice) {
+                      maxPrice = price
+                      maxIdx = i
+                    }
+                  }
 
-              // The outcome with price closest to 1 is the winner
-              const maxPriceIndex = prices.reduce((maxIdx: number, price: string, idx: number) => {
-                return parseFloat(price) > parseFloat(prices[maxIdx]) ? idx : maxIdx
-              }, 0)
-
-              // Only mark as resolved if there's a clear winner (price > 0.9)
-              if (parseFloat(prices[maxPriceIndex]) > 0.9) {
-                winningOutcome = outcomes[maxPriceIndex]
+                  if (maxPrice > 0.9) {
+                    winningOutcome = outcomes[maxIdx]
+                  }
+                } catch (e) {
+                  console.error('Error parsing outcomes:', e)
+                }
               }
-            } catch (parseErr) {
-              console.error(`Error parsing outcomes for ${market.id}:`, parseErr)
+
+              const { error: updateError } = await supabase
+                .from('markets')
+                .update({
+                  resolved: true,
+                  winning_outcome: winningOutcome,
+                  slug: pmMarket.slug,
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', market.id)
+
+              if (!updateError) {
+                updated++
+                console.log(`Updated ${market.id}: ${winningOutcome}`)
+              }
             }
           }
+        }
+      } catch (err) {
+        // Silently continue on individual errors
+      }
 
-          // Update the market with resolution data
-          const { error: updateError } = await supabase
+      // Rate limit
+      if (checked % 20 === 0) {
+        await new Promise(resolve => setTimeout(resolve, 300))
+      }
+    }
+
+    // Step 3: Also fetch recently closed events from Polymarket to catch any new ones
+    const closedResponse = await fetch('https://gamma-api.polymarket.com/events?closed=true&limit=50&order=updatedAt&ascending=false', {
+      headers: { 'Accept': 'application/json' }
+    })
+
+    if (closedResponse.ok) {
+      const events = await closedResponse.json()
+      console.log(`Fetched ${events.length} recently closed events`)
+
+      for (const event of events) {
+        if (!event.markets || !Array.isArray(event.markets)) continue
+
+        for (const market of event.markets) {
+          if (!market.closed) continue
+          checked++
+
+          let winningOutcome = null
+          if (market.outcomePrices) {
+            try {
+              const prices = JSON.parse(market.outcomePrices)
+              const outcomes = JSON.parse(market.outcomes || '["Yes", "No"]')
+
+              let maxPrice = 0
+              let maxIdx = 0
+              for (let i = 0; i < prices.length; i++) {
+                const price = parseFloat(prices[i])
+                if (price > maxPrice) {
+                  maxPrice = price
+                  maxIdx = i
+                }
+              }
+
+              if (maxPrice > 0.9) {
+                winningOutcome = outcomes[maxIdx]
+              }
+            } catch (e) {}
+          }
+
+          // Update by conditionId
+          const { error } = await supabase
             .from('markets')
             .update({
               resolved: true,
               winning_outcome: winningOutcome,
+              slug: market.slug,
               updated_at: new Date().toISOString()
             })
-            .eq('id', market.id)
+            .eq('id', market.conditionId)
 
-          if (!updateError) {
+          if (!error) {
             updated++
-            console.log(`Updated market ${market.id}: resolved=true, winning_outcome=${winningOutcome}`)
-          } else {
-            console.error(`Error updating market ${market.id}:`, updateError)
           }
         }
-      } catch (err) {
-        console.error(`Error checking market ${market.id}:`, err)
-      }
-
-      // Rate limit to avoid hammering the API
-      if (checked % 10 === 0) {
-        await new Promise(resolve => setTimeout(resolve, 500))
       }
     }
 
